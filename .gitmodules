@@ -1,0 +1,6 @@
+[submodule "components/shift_registers"]
+	path = components/shift_registers
+	url = git@github.com:meeeerkat/esp32_shift_registers.git
+[submodule "components/shift_stepper_motor_controller"]
+	path = components/shift_stepper_motor_controller
+	url = git@github.com:meeeerkat/esp32_shift_stepper_motor_controller.git

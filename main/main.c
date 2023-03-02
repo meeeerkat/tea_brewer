@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/timers.h"
 #include "driver/gpio.h"
 
 
@@ -19,12 +20,25 @@
 
 #define STRAINER_MOTOR_STEPS 800
 
+
+
+// Coffee maker & cup parameters
 const uint64_t WARMUP_DURATION = 40 * 1000;                         // 40 s
 const uint64_t POURING_DURATION_PER_ML = (6 * 60 * 1000) / 400;     // 6 min for 400ml
 const uint8_t BREWING_SINCE_PERCENT = 75;
 
+const uint64_t VOLUME = 400;                // ml
+const uint64_t BREW_DURATION = 5*60*1000;   // ms
 
-enum Event {StartEvent, ResetEvent};
+
+
+
+
+
+enum Event {StartEvent, ResetEvent, PouredEvent, InfusedEvent, ResetedEvent};
+enum State {Waiting, Pouring, Infusing, Reseting};
+
+
 
 
 static QueueHandle_t events_queue = NULL;
@@ -35,39 +49,93 @@ static void IRAM_ATTR event_isr_handler(void* arg) {
 }
 
 
-void brew(shift_stepper_motor_controller_t* ssmc, uint64_t volume /* ml */, uint64_t brew_duration /* ms */) {
-  
+void update_state(const enum Event event);
 
+// State functions
+shift_register_t sr;
+shift_stepper_motor_controller_t ssmc;
+TimerHandle_t pouring_timer, infusing_timer;
+
+void pour() {
   // Powering on coffee machine
-  gpio_set_level(23, 1);
+  gpio_set_level(COFFEE_MAKER_RELAY_GPIO, 1);
 
   // Moving the tea strainer over the cup
-  shift_stepper_motor_controller__move(ssmc, 0, STRAINER_MOTOR_STEPS);
+  shift_stepper_motor_controller__moveto(&ssmc, 0, 0);
 
-  const uint64_t pouring_duration = POURING_DURATION_PER_ML * volume;
-  vTaskDelay(pdMS_TO_TICKS((pouring_duration + WARMUP_DURATION)));
+  xTimerStart(pouring_timer, portMAX_DELAY);
+}
 
+void infuse() {
   // Powering down coffee machine
-  gpio_set_level(23, 0);
+  gpio_set_level(COFFEE_MAKER_RELAY_GPIO, 0);
+  
+  xTimerStart(infusing_timer, portMAX_DELAY);
+}
 
-  // When pouring is really slow (due to the coffee maker), the tea already has some time to brew (brewing since the cup is filled at 75%)
-  uint64_t actual_brewing_wait_duration = brew_duration - (pouring_duration*(100-BREWING_SINCE_PERCENT))/100;
-  if (actual_brewing_wait_duration > 0) // if we jump this brewing time, the coffee maker is way too slow
-    vTaskDelay(pdMS_TO_TICKS(actual_brewing_wait_duration));
 
-  // Moving the tea strainer out of the cup and over the bin
-  shift_stepper_motor_controller__move(ssmc, 0, -STRAINER_MOTOR_STEPS);
+void reset() {
+  // Powering down coffee machine
+  gpio_set_level(COFFEE_MAKER_RELAY_GPIO, 0);
 
-  // NEED TO EMPTY THE finished_movement_queue ???
-  QueueHandle_t* queue = shift_stepper_motor_controller_finished_movement_queue(ssmc);
+  // Reseting strainer position
+  QueueHandle_t* queue = shift_stepper_motor_controller_finished_movement_queue(&ssmc);
   uint8_t id;
   while(xQueueReceive(*queue, &id, 0) == pdTRUE);
+  shift_stepper_motor_controller__moveto(&ssmc, 0, -STRAINER_MOTOR_STEPS);
+
+  update_state(ResetedEvent);
 }
 
 
 
-shift_register_t sr;
-shift_stepper_motor_controller_t ssmc;
+// State machine
+enum State state = Waiting;
+
+void update_state(const enum Event event) {
+
+  if (event == ResetedEvent) {
+    state = Waiting;
+    return;
+  }
+
+  // For all states we can start a reset (even waiting)
+  if (event == ResetEvent) {
+    state = Reseting;
+    reset();
+    return;
+  }
+
+  if (state == Waiting && event == StartEvent) {
+    state = Pouring;
+    pour();
+    return;
+  }
+
+  if (state == Pouring && event == PouredEvent) {
+    state = Infusing;
+    infuse();
+    return;
+  }
+
+  // Basically a reset...
+  if (state == Infusing && event == InfusedEvent) {
+    state = Reseting;
+    reset();
+    return;
+  }
+}
+
+void update_state_timer_callback(TimerHandle_t timer) {
+  const enum Event event = (const enum Event) pvTimerGetTimerID(timer);
+  update_state(event);
+}
+
+
+
+
+
+
 
 void app_main(void) {
   shift_register__init(&sr, SER_GPIO, SCLK_GPIO, SRCLK_GPIO, 8);
@@ -91,25 +159,37 @@ void app_main(void) {
   //hook isr handler for specific gpio pin
   gpio_isr_handler_add(RESET_BUTTON_GPIO, event_isr_handler, (void*) ResetEvent);
 
-
   //create a queue to handle gpio event from isr
   events_queue = xQueueCreate(10, sizeof(uint8_t));
 
 
+  // Create timers
+  const uint64_t pouring_duration = POURING_DURATION_PER_ML * VOLUME;
+  
+  pouring_timer = xTimerCreate(
+      "pouring_timer",
+      pdMS_TO_TICKS(pouring_duration + WARMUP_DURATION),
+      pdFALSE,
+      (void*) PouredEvent,
+      update_state_timer_callback);
+
+  int64_t actual_brewing_wait_duration = BREW_DURATION - (pouring_duration*(100-BREWING_SINCE_PERCENT))/100;
+  if (actual_brewing_wait_duration < 0)
+    actual_brewing_wait_duration = 0;
+
+  infusing_timer = xTimerCreate(
+      "infusing_timer",
+      pdMS_TO_TICKS(actual_brewing_wait_duration),
+      pdFALSE,
+      (void*) InfusedEvent,
+      update_state_timer_callback);
+
+
+
   enum Event event;
   for(;;)
-    if(xQueueReceive(events_queue, &event, portMAX_DELAY)) {
-      switch (event) {
-        case StartEvent:
-          brew(&ssmc, 300, 4*60*1000);
-          break;
-        case ResetEvent:
-          shift_stepper_motor_controller__move(&ssmc, 0, -STRAINER_MOTOR_STEPS);
-          break;
-        default:
-          break;
-      }
-    }
+    if(xQueueReceive(events_queue, &event, portMAX_DELAY))
+      update_state(event);
 
 
 
